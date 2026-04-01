@@ -3,6 +3,44 @@
 A Model Context Protocol (MCP) server for Juniper Junos devices that enables
 LLM interactions with network equipment.
 
+## SSH Connection Pooling (Fork Enhancement)
+
+This fork implements SSH connection pooling inspired by [h-cli's h-ssh-llm](https://github.com/h-network/h-cli/tree/main/hssh_llm/h-ssh). The original server opens a **fresh SSH/NETCONF session for every tool call** and tears it down immediately after. In an MCP/LLM context where conversations involve many sequential commands, this creates massive overhead.
+
+### The Fix
+
+A thread-safe `ConnectionPool` class in `jmcp.py` that:
+- **Reuses SSH sessions** across tool calls (connect once, execute many)
+- **Auto-reconnects** stale connections transparently
+- **Idle timeout cleanup** closes unused connections (default 300s, configurable via `JMCP_POOL_IDLE_TIMEOUT`)
+- **Thread-safe** for parallel batch operations
+
+### Benchmark Results
+
+Tested on 5 Junos routers, 7 daily operations commands (35 total operations):
+
+```
+Command                                             Original       Pool+Seq  Pool+Parallel
+--------------------------------------------------------------------------------------------------------------
+show ospf interface                                   3.423s         0.505s         0.154s
+show ospf database                                    3.425s         0.448s         0.138s
+show ospf neighbor                                    3.494s         0.445s         0.139s
+show route 10.0.14.0                                  3.410s         0.647s         0.144s
+show chassis hardware                                 3.440s         0.448s         0.142s
+show route 10.0.15.0 extensive                        3.383s         0.446s         0.164s
+show route forwarding-table all destination 10.0.15.0 3.909s         1.039s         0.300s
+--------------------------------------------------------------------------------------------------------------
+TOTAL                                                24.484s         3.978s         1.181s
+
+SPEEDUP vs Original:
+  Pool + Sequential:  6.2x faster
+  Pool + Parallel:    20.7x faster
+```
+
+- **Connection pooling alone** eliminates 30 out of 35 SSH handshakes: **6.2x faster**
+- **Pool + parallel execution**: **20.7x faster**
+- Full benchmark methodology and reproduction steps: [`benchmark/`](benchmark/)
+
 ## Table of Contents
 
 - [junos-mcp-server](#junos-mcp-server)
