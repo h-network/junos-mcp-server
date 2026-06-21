@@ -112,9 +112,7 @@ class ConnectionPool:
             target=self._cleanup_loop, daemon=True, name="pool-cleanup"
         )
         self._cleanup_thread.start()
-        log.info(
-            "Connection pool initialized (idle_timeout=%ds)", self._idle_timeout
-        )
+        log.info("Connection pool initialized (idle_timeout=%ds)", self._idle_timeout)
 
     @contextmanager
     def get_connection(self, router_name: str, timeout: int = 360):
