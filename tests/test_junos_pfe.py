@@ -28,9 +28,13 @@ def load_devices(devices_file: str) -> bool:
 class JunosPfeHelperTests(unittest.TestCase):
     def setUp(self):
         self._original_devices = jmcp.devices.copy()
+        # connection_pool is a module-level singleton; drop any connection a
+        # previous test cached so each test gets its own freshly-mocked device.
+        jmcp.connection_pool.close_all(shutdown=False)
 
     def tearDown(self):
         jmcp.devices = self._original_devices
+        jmcp.connection_pool.close_all(shutdown=False)
 
     @patch("jmcp.Device")
     def test_run_junos_pfe_command_success(self, mock_device_class):
@@ -82,7 +86,9 @@ class JunosPfeHelperTests(unittest.TestCase):
     @patch("jmcp.Device")
     def test_run_junos_pfe_command_generic_exception(self, mock_device_class):
         mock_device = MagicMock()
-        mock_device.__enter__.side_effect = Exception("Generic failure")
+        # The pool yields the device directly (no `with Device()`), so simulate a
+        # generic failure on the RPC call itself rather than on __enter__.
+        mock_device.rpc.request_pfe_execute.side_effect = Exception("Generic failure")
         mock_device_class.return_value = mock_device
         devices = {"router1": get_device("router1")}
         jmcp.devices = devices
