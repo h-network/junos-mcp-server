@@ -153,7 +153,6 @@ class ConnectionPool:
 
             device.timeout = timeout
             yield device
-            entry["last_used"] = time.time()
         except Exception:
             # Invalidate connection if it's no longer alive
             if entry["device"] is not None and not entry["device"].connected:
@@ -164,6 +163,11 @@ class ConnectionPool:
                 entry["device"] = None
             raise
         finally:
+            # Refresh last_used on every borrow — success OR failure. Otherwise a
+            # connection whose operation raised while still connected keeps
+            # last_used at 0.0, and the idle-cleanup loop (which requires
+            # last_used > 0) would never reap it.
+            entry["last_used"] = time.time()
             entry["lock"].release()
 
     def _get_or_create_entry(self, router_name: str) -> dict:
@@ -1922,14 +1926,20 @@ async def handle_reload_devices(
             )
         ]
 
-    # Drop pooled connections since device configs may have changed, but keep
-    # the pool (and its idle-cleanup thread) alive. Run in a worker thread so
-    # the blocking device.close() calls don't stall the async event loop.
-    await anyio.to_thread.run_sync(connection_pool.close_all, False)
-
     old_count = len(devices)
+    # Swap the device map FIRST, then drop the old pooled connections. Order
+    # matters: connection_pool.get_connection() reads `devices` only after
+    # creating its pool entry, and entry creation is serialized with
+    # close_all()'s snapshot via the pool's global lock. So any connection a
+    # concurrent tool call opens during the reset is guaranteed to use the NEW
+    # config — no old-config connection can slip past the close. close_all keeps
+    # the pool (and idle-cleanup thread) alive and waits for in-flight ops via
+    # the per-router lock; run it in a worker thread so its blocking
+    # device.close() calls don't stall the async event loop.
     devices = new_devices
     new_count = len(devices)
+
+    await anyio.to_thread.run_sync(connection_pool.close_all, False)
 
     log.info(
         "Reloaded devices from '%s': %s -> %s device(s)",
@@ -2106,19 +2116,16 @@ async def handle_load_and_commit_config(
                     try:
                         config_util.rollback()
                         config_util.unlock()
-                    except (
-                        ConfigLoadError,
-                        CommitError,
-                        LockError,
-                        RuntimeError,
-                        OSError,
-                        AttributeError,
-                    ):
-                        # Rollback/unlock failed: this session may still hold the
-                        # config lock. Drop the transport so the pool evicts it
-                        # (via the `not device.connected` check in get_connection)
-                        # on next use, instead of returning a locked session that
-                        # fails every later commit with "database is locked".
+                    except Exception:
+                        # Cleanup failed for ANY reason (e.g. unlock() raising
+                        # UnlockError, or rollback() a bare RpcError — neither a
+                        # subclass of the previously-allowlisted types): this
+                        # session may still hold the config lock. Drop the
+                        # transport so the pool evicts it (via the
+                        # `not device.connected` check in get_connection) instead
+                        # of returning a locked session that fails every later
+                        # commit with "database is locked". Classifying the
+                        # failure is the outer `except Exception as e`'s job.
                         try:
                             junos_device.close()
                         except Exception:

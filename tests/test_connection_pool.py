@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import jmcp
+from jnpr.junos.exception import UnlockError
 from tests.test_device_data import get_device
 
 
@@ -76,6 +77,26 @@ class ConnectionPoolLifecycleTests(unittest.TestCase):
         fake_lock.__exit__.assert_called_once()
         fake_device.close.assert_called_once()
 
+    def test_last_used_refreshed_after_failed_operation(self):
+        # Regression: a borrow whose operation raises but leaves the device
+        # connected must still refresh last_used, or idle cleanup (which requires
+        # last_used > 0) would never reap that connection.
+        dev = MagicMock()
+        dev.connected = True
+        self.pool._connections["R1"] = {
+            "device": dev,
+            "lock": threading.Lock(),
+            "last_used": 0.0,
+        }
+        try:
+            with self.pool.get_connection("R1"):
+                raise RuntimeError("operation failed mid-RPC")
+        except RuntimeError:
+            pass
+        # device still connected -> not evicted, but last_used must be refreshed
+        self.assertIs(self.pool._connections["R1"]["device"], dev)
+        self.assertGreater(self.pool._connections["R1"]["last_used"], 0)
+
 
 class LoadCommitLockLeakTests(unittest.TestCase):
     """Regression: a failed commit whose rollback/unlock also fail must not
@@ -92,21 +113,27 @@ class LoadCommitLockLeakTests(unittest.TestCase):
     @patch("jmcp.check_config_blocklist", return_value=(False, ""))
     @patch("jmcp.Config")
     @patch("jmcp.Device")
-    def test_failed_commit_and_rollback_drops_locked_session(
+    def test_failed_commit_then_unlock_error_evicts_locked_session(
         self, mock_device_cls, mock_config_cls, _mock_blocklist
     ):
-        # Device the pool will hand out.
+        # Device the pool will hand out. close() drops the session, so the pool
+        # must not reuse it afterwards.
         mock_device = MagicMock()
         mock_device.connected = True
+
+        def _close():
+            mock_device.connected = False
+
+        mock_device.close.side_effect = _close
         mock_device_cls.return_value = mock_device
 
-        # lock() ok, load() ok, diff() truthy, then commit() fails AND the
-        # rollback()/unlock() in the handler's except-block also fail.
+        # lock() ok, load() ok, diff() truthy, commit() fails, and unlock()
+        # raises UnlockError — the REAL failure mode (UnlockError subclasses
+        # RpcError, not any of the previously-allowlisted types).
         cfg = MagicMock()
         cfg.diff.return_value = "+ set system host-name x"
         cfg.commit.side_effect = RuntimeError("commit failed")
-        cfg.rollback.side_effect = RuntimeError("rollback failed")
-        cfg.unlock.side_effect = RuntimeError("unlock failed")
+        cfg.unlock.side_effect = UnlockError(rsp=None)
         mock_config_cls.return_value = cfg
 
         jmcp.devices = {"router1": get_device("router1")}
@@ -127,9 +154,14 @@ class LoadCommitLockLeakTests(unittest.TestCase):
         )
 
         self.assertIn("Failed to load/commit configuration", result[0].text)
-        # The fix: the still-locked session's transport is dropped so the pool
-        # evicts it on next use instead of handing back a locked session.
+        # Cleanup dropped the transport...
         mock_device.close.assert_called()
+        # ...and the pool actually evicts it: the next borrow builds a fresh
+        # Device instead of reusing the locked session.
+        before = mock_device_cls.call_count
+        with jmcp.connection_pool.get_connection("router1"):
+            pass
+        self.assertGreater(mock_device_cls.call_count, before)
 
 
 if __name__ == "__main__":
