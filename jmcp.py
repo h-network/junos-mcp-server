@@ -224,8 +224,16 @@ class ConnectionPool:
         """
         if shutdown:
             self._running = False
+        # Detach all entries under the global lock, then close each under its
+        # own per-router lock (outside the global lock). Acquiring entry["lock"]
+        # makes us wait for any in-flight operation to finish instead of closing
+        # a live transport mid-RPC, and avoids holding the global lock — which
+        # would block unrelated routers — for the whole close loop.
         with self._pool_lock:
-            for router_name, entry in self._connections.items():
+            entries = list(self._connections.items())
+            self._connections.clear()
+        for router_name, entry in entries:
+            with entry["lock"]:
                 if entry["device"] is not None:
                     try:
                         entry["device"].close()
@@ -2104,7 +2112,15 @@ async def handle_load_and_commit_config(
                         OSError,
                         AttributeError,
                     ):
-                        pass
+                        # Rollback/unlock failed: this session may still hold the
+                        # config lock. Drop the transport so the pool evicts it
+                        # (via the `not device.connected` check in get_connection)
+                        # on next use, instead of returning a locked session that
+                        # fails every later commit with "database is locked".
+                        try:
+                            junos_device.close()
+                        except Exception:
+                            pass
                     return f"Failed to load/commit configuration: {e}"
 
         try:

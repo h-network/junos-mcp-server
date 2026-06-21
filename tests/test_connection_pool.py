@@ -5,17 +5,19 @@ Focus: reload must drop pooled connections WITHOUT killing the pool's
 idle-cleanup thread, while shutdown must stop it.
 """
 
+import asyncio
 import sys
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import jmcp
+from tests.test_device_data import get_device
 
 
 class ConnectionPoolLifecycleTests(unittest.TestCase):
@@ -57,6 +59,77 @@ class ConnectionPoolLifecycleTests(unittest.TestCase):
         self.pool.close_all(shutdown=False)
         fake_device.close.assert_called_once()
         self.assertEqual(self.pool._connections, {})
+
+    def test_close_all_acquires_per_router_lock(self):
+        # Regression: close_all must take each entry's per-router lock before
+        # closing it, so an in-flight operation is waited out rather than having
+        # its live transport closed mid-RPC.
+        fake_device = MagicMock()
+        fake_lock = MagicMock()
+        self.pool._connections["R1"] = {
+            "device": fake_device,
+            "lock": fake_lock,
+            "last_used": 1.0,
+        }
+        self.pool.close_all(shutdown=False)
+        fake_lock.__enter__.assert_called_once()
+        fake_lock.__exit__.assert_called_once()
+        fake_device.close.assert_called_once()
+
+
+class LoadCommitLockLeakTests(unittest.TestCase):
+    """Regression: a failed commit whose rollback/unlock also fail must not
+    leave a still-config-locked session in the pool."""
+
+    def setUp(self):
+        self._orig_devices = jmcp.devices.copy()
+        jmcp.connection_pool.close_all(shutdown=False)
+
+    def tearDown(self):
+        jmcp.devices = self._orig_devices
+        jmcp.connection_pool.close_all(shutdown=False)
+
+    @patch("jmcp.check_config_blocklist", return_value=(False, ""))
+    @patch("jmcp.Config")
+    @patch("jmcp.Device")
+    def test_failed_commit_and_rollback_drops_locked_session(
+        self, mock_device_cls, mock_config_cls, _mock_blocklist
+    ):
+        # Device the pool will hand out.
+        mock_device = MagicMock()
+        mock_device.connected = True
+        mock_device_cls.return_value = mock_device
+
+        # lock() ok, load() ok, diff() truthy, then commit() fails AND the
+        # rollback()/unlock() in the handler's except-block also fail.
+        cfg = MagicMock()
+        cfg.diff.return_value = "+ set system host-name x"
+        cfg.commit.side_effect = RuntimeError("commit failed")
+        cfg.rollback.side_effect = RuntimeError("rollback failed")
+        cfg.unlock.side_effect = RuntimeError("unlock failed")
+        mock_config_cls.return_value = cfg
+
+        jmcp.devices = {"router1": get_device("router1")}
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+        ctx.warning = AsyncMock()
+        ctx.error = AsyncMock()
+
+        result = asyncio.run(
+            jmcp.handle_load_and_commit_config(
+                {
+                    "router_name": "router1",
+                    "config_text": "set system host-name x",
+                    "config_format": "set",
+                },
+                ctx,
+            )
+        )
+
+        self.assertIn("Failed to load/commit configuration", result[0].text)
+        # The fix: the still-locked session's transport is dropped so the pool
+        # evicts it on next use instead of handing back a locked session.
+        mock_device.close.assert_called()
 
 
 if __name__ == "__main__":
