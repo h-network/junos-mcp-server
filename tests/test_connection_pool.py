@@ -8,6 +8,7 @@ idle-cleanup thread, while shutdown must stop it.
 import asyncio
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,7 +18,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import jmcp
-from jnpr.junos.exception import UnlockError
+from jnpr.junos.exception import RpcTimeoutError, UnlockError
 from tests.test_device_data import get_device
 
 
@@ -55,11 +56,15 @@ class ConnectionPoolLifecycleTests(unittest.TestCase):
         self.pool.close_all(shutdown=True)
         self.assertFalse(self.pool._running)
 
-    def test_reload_closes_and_clears_connections(self):
+    def test_reload_closes_connection_but_keeps_entry(self):
+        # close_all closes the device but must NOT remove the entry from
+        # _connections. Clearing would detach an entry an in-flight borrow holds,
+        # orphaning the connection it is about to open. Entry stays, device=None.
         fake_device = self._inject_fake_connection("R1")
         self.pool.close_all(shutdown=False)
         fake_device.close.assert_called_once()
-        self.assertEqual(self.pool._connections, {})
+        self.assertIn("R1", self.pool._connections)
+        self.assertIsNone(self.pool._connections["R1"]["device"])
 
     def test_close_all_acquires_per_router_lock(self):
         # Regression: close_all must take each entry's per-router lock before
@@ -73,9 +78,57 @@ class ConnectionPoolLifecycleTests(unittest.TestCase):
             "last_used": 1.0,
         }
         self.pool.close_all(shutdown=False)
-        fake_lock.__enter__.assert_called_once()
-        fake_lock.__exit__.assert_called_once()
+        fake_lock.acquire.assert_called_once()
+        fake_lock.release.assert_called_once()
         fake_device.close.assert_called_once()
+
+    @patch("jmcp.Device")
+    def test_open_failure_closes_partial_device(self, mock_device_cls):
+        # M3: if Device.open() raises (possibly after partially establishing the
+        # transport), the local device must be closed so it is not leaked.
+        failed_device = MagicMock()
+        failed_device.open.side_effect = RuntimeError("open failed")
+        mock_device_cls.return_value = failed_device
+        orig = jmcp.devices
+        jmcp.devices = {"router1": get_device("router1")}
+        try:
+            with self.assertRaises(RuntimeError):
+                with self.pool.get_connection("router1"):
+                    pass
+        finally:
+            jmcp.devices = orig
+        failed_device.close.assert_called_once()
+        self.assertIsNone(self.pool._connections["router1"]["device"])
+
+    def test_rpc_timeout_evicts_session(self):
+        # R2#2: RpcTimeoutError leaves device.connected True, but the poisoned
+        # session must be evicted (closed + dropped) so it is not reused.
+        dev = MagicMock()
+        dev.connected = True
+        self.pool._connections["router1"] = {
+            "device": dev,
+            "lock": threading.Lock(),
+            "last_used": 1.0,
+        }
+        with self.assertRaises(RpcTimeoutError):
+            with self.pool.get_connection("router1"):
+                raise RpcTimeoutError(dev, None, 1)
+        dev.close.assert_called_once()
+        self.assertIsNone(self.pool._connections["router1"]["device"])
+
+    def test_cleanup_idle_reaps_aged_connection(self):
+        # The idle reaper (previously untested) must close a connection idle past
+        # the timeout and drop the device.
+        dev = MagicMock()
+        dev.connected = True
+        self.pool._connections["router1"] = {
+            "device": dev,
+            "lock": threading.Lock(),
+            "last_used": time.time() - 10_000,  # well past idle_timeout=300
+        }
+        self.pool._cleanup_idle()
+        dev.close.assert_called_once()
+        self.assertIsNone(self.pool._connections["router1"]["device"])
 
     def test_last_used_refreshed_after_failed_operation(self):
         # Regression: a borrow whose operation raises but leaves the device

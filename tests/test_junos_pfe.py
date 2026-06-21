@@ -42,7 +42,8 @@ class JunosPfeHelperTests(unittest.TestCase):
         mock_device = MagicMock()
         mock_rpc = MagicMock()
         mock_rpc.request_pfe_execute.return_value.text = "PFE command output"
-        mock_device.__enter__.return_value = mock_device
+        # The pool yields the Device directly (no `with Device()`), so no
+        # __enter__ wiring is needed.
         mock_device.rpc = mock_rpc
         mock_device_class.return_value = mock_device
 

@@ -39,7 +39,13 @@ import mcp.types as types
 import yaml
 from jinja2 import Environment, TemplateError
 from jnpr.junos import Device
-from jnpr.junos.exception import ConnectError, ConfigLoadError, CommitError, LockError
+from jnpr.junos.exception import (
+    ConnectError,
+    ConfigLoadError,
+    CommitError,
+    LockError,
+    RpcTimeoutError,
+)
 from jnpr.junos.utils.config import Config
 from mcp.server.elicitation import (
     AcceptedElicitation,
@@ -90,7 +96,7 @@ class ConnectionPool:
     (default 300s, configurable via JMCP_POOL_IDLE_TIMEOUT env var).
     """
 
-    def __init__(self, idle_timeout: int = None):
+    def __init__(self, idle_timeout: int | None = None):
         self._connections: dict[str, dict] = {}
         self._pool_lock = threading.Lock()
         if idle_timeout is None:
@@ -143,7 +149,18 @@ class ConnectionPool:
                 device_info = devices[router_name]
                 connect_params = prepare_connection_params(device_info, router_name)
                 device = Device(**connect_params)
-                device.open()
+                try:
+                    device.open()
+                except Exception:
+                    # open() may have partially established the transport before
+                    # raising; close the local device so we don't leak it (it was
+                    # never stored in entry["device"], so the except block below
+                    # would not see it).
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                    raise
                 entry["device"] = device
                 log.info("Pool: opened new connection to %s", router_name)
             else:
@@ -151,11 +168,18 @@ class ConnectionPool:
 
             device.timeout = timeout
             yield device
-        except Exception:
-            # Invalidate connection if it's no longer alive
-            if entry["device"] is not None and not entry["device"].connected:
+        except Exception as exc:
+            # Invalidate the pooled connection if it is no longer usable: either
+            # the transport dropped (not connected), or an RPC timed out.
+            # RpcTimeoutError leaves device.connected True but the session is no
+            # longer reliable; pre-pooling, every call opened a fresh session so
+            # a timeout never poisoned later calls — evict to preserve that.
+            dev = entry["device"]
+            if dev is not None and (
+                not dev.connected or isinstance(exc, RpcTimeoutError)
+            ):
                 try:
-                    entry["device"].close()
+                    dev.close()
                 except Exception:
                     pass
                 entry["device"] = None
@@ -185,34 +209,47 @@ class ConnectionPool:
 
     def _cleanup_idle(self):
         now = time.time()
+        # Collect idle candidates under the global lock, then close OUTSIDE it.
+        # Holding _pool_lock across a blocking device.close() (a black-holed
+        # device can stall on TCP/SSH timeout) would freeze every router's
+        # borrow, since get_connection() needs the same lock. Mirrors close_all.
+        candidates = []
         with self._pool_lock:
-            for router_name in list(self._connections):
-                entry = self._connections[router_name]
-                if entry["lock"].locked():
-                    continue
+            for router_name, entry in self._connections.items():
                 if (
                     entry["device"] is not None
                     and entry["last_used"] > 0
                     and (now - entry["last_used"]) > self._idle_timeout
                 ):
-                    if entry["lock"].acquire(blocking=False):
-                        try:
-                            try:
-                                entry["device"].close()
-                            except Exception as e:
-                                log.debug(
-                                    "Pool: error closing idle connection to %s: %s",
-                                    router_name,
-                                    e,
-                                )
-                            entry["device"] = None
-                            log.info(
-                                "Pool: closed idle connection to %s (idle %.0fs)",
-                                router_name,
-                                now - entry["last_used"],
-                            )
-                        finally:
-                            entry["lock"].release()
+                    candidates.append((router_name, entry))
+        for router_name, entry in candidates:
+            # Non-blocking: skip entries currently in use this cycle.
+            if not entry["lock"].acquire(blocking=False):
+                continue
+            try:
+                # Re-check under the lock: the entry may have been used or closed
+                # between collection and acquiring the lock.
+                if (
+                    entry["device"] is not None
+                    and entry["last_used"] > 0
+                    and (now - entry["last_used"]) > self._idle_timeout
+                ):
+                    try:
+                        entry["device"].close()
+                    except Exception as e:
+                        log.debug(
+                            "Pool: error closing idle connection to %s: %s",
+                            router_name,
+                            e,
+                        )
+                    entry["device"] = None
+                    log.info(
+                        "Pool: closed idle connection to %s (idle %.0fs)",
+                        router_name,
+                        now - entry["last_used"],
+                    )
+            finally:
+                entry["lock"].release()
 
     def close_all(self, shutdown: bool = True):
         """Close all pooled connections.
@@ -226,16 +263,26 @@ class ConnectionPool:
         """
         if shutdown:
             self._running = False
-        # Detach all entries under the global lock, then close each under its
-        # own per-router lock (outside the global lock). Acquiring entry["lock"]
-        # makes us wait for any in-flight operation to finish instead of closing
-        # a live transport mid-RPC, and avoids holding the global lock — which
-        # would block unrelated routers — for the whole close loop.
+        # Snapshot entries under the global lock, then close each under its own
+        # per-router lock (outside the global lock, so a slow close can't block
+        # unrelated routers). Do NOT clear _connections: clearing would detach an
+        # entry that an in-flight get_connection() borrow already holds, leaving
+        # the connection it is about to open untracked and never reaped. Leaving
+        # device=None entries behind is cheap and keeps every connection
+        # reapable.
         with self._pool_lock:
             entries = list(self._connections.items())
-            self._connections.clear()
         for router_name, entry in entries:
-            with entry["lock"]:
+            if shutdown:
+                # Shutdown: don't wait on an in-flight op (the process is exiting
+                # and the OS reclaims sockets) — skip busy entries so SIGTERM
+                # during a long command doesn't hang teardown.
+                if not entry["lock"].acquire(blocking=False):
+                    continue
+            else:
+                # Reload: wait for in-flight ops so we don't sever a live RPC.
+                entry["lock"].acquire()
+            try:
                 if entry["device"] is not None:
                     try:
                         entry["device"].close()
@@ -246,19 +293,9 @@ class ConnectionPool:
                             e,
                         )
                     entry["device"] = None
+            finally:
+                entry["lock"].release()
         log.info("Connection pool: all connections closed")
-
-    @property
-    def stats(self) -> dict:
-        """Return pool statistics."""
-        with self._pool_lock:
-            total = len(self._connections)
-            active = sum(
-                1
-                for e in self._connections.values()
-                if e["device"] is not None and e["device"].connected
-            )
-            return {"total_entries": total, "active_connections": active}
 
 
 # Global connection pool instance
@@ -1230,7 +1267,10 @@ async def handle_execute_junos_command_batch(
     import asyncio
 
     batch_start_time = time.time()
-    router_names = arguments.get("router_names", [])
+    # Dedupe while preserving order: with the connection pool, repeated routers
+    # share one per-router lock and would run serially (and waste worker
+    # threads) instead of in parallel.
+    router_names = list(dict.fromkeys(arguments.get("router_names", [])))
     command = arguments.get("command", "")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
 
