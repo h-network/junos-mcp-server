@@ -212,9 +212,18 @@ class ConnectionPool:
                         finally:
                             entry["lock"].release()
 
-    def close_all(self):
-        """Close all pooled connections."""
-        self._running = False
+    def close_all(self, shutdown: bool = True):
+        """Close all pooled connections.
+
+        Args:
+            shutdown: If True (default), also stop the idle-cleanup thread —
+                use on server shutdown. If False, drop all connections but
+                keep the pool operational (cleanup thread keeps running) —
+                use on device reload, where configs changed but the pool
+                must keep serving.
+        """
+        if shutdown:
+            self._running = False
         with self._pool_lock:
             for router_name, entry in self._connections.items():
                 if entry["device"] is not None:
@@ -1903,8 +1912,10 @@ async def handle_reload_devices(
             )
         ]
 
-    # Close all pooled connections since device configs may have changed
-    connection_pool.close_all()
+    # Drop pooled connections since device configs may have changed, but keep
+    # the pool (and its idle-cleanup thread) alive. Run in a worker thread so
+    # the blocking device.close() calls don't stall the async event loop.
+    await anyio.to_thread.run_sync(connection_pool.close_all, False)
 
     old_count = len(devices)
     devices = new_devices
