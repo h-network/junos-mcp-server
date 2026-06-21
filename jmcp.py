@@ -134,6 +134,13 @@ class ConnectionPool:
         Raises:
             ValueError: If connection params are invalid
             ConnectError: If SSH connection fails
+
+        Note:
+            Handlers reach the pool via anyio.to_thread.run_sync, which shares
+            anyio's process-wide default thread limiter (40 tokens). A batch
+            over >40 routers, or 40+ concurrent same-router calls, will queue at
+            that ceiling; the per-router lock below also serializes same-router
+            work.
         """
         entry = self._get_or_create_entry(router_name)
         entry["lock"].acquire()
@@ -1965,15 +1972,15 @@ async def handle_reload_devices(
         ]
 
     old_count = len(devices)
-    # Swap the device map FIRST, then drop the old pooled connections. Order
-    # matters: connection_pool.get_connection() reads `devices` only after
-    # creating its pool entry, and entry creation is serialized with
-    # close_all()'s snapshot via the pool's global lock. So any connection a
-    # concurrent tool call opens during the reset is guaranteed to use the NEW
-    # config — no old-config connection can slip past the close. close_all keeps
-    # the pool (and idle-cleanup thread) alive and waits for in-flight ops via
-    # the per-router lock; run it in a worker thread so its blocking
-    # device.close() calls don't stall the async event loop.
+    # Swap the device map FIRST, then drop the old pooled connections. close_all
+    # snapshots entries under the pool's global lock and closes each once its
+    # per-router lock frees, so no old-config connection is leaked past the
+    # reset. (A borrow already in flight may still complete one op on the
+    # previous config, and a router dropped mid-reload can raise KeyError from
+    # devices[...], which is caught and returned as an error string, not a
+    # crash.) Run close_all in a worker thread so its blocking device.close()
+    # calls don't stall the event loop; it keeps the pool and cleanup thread
+    # alive.
     devices = new_devices
     new_count = len(devices)
 
