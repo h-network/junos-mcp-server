@@ -106,7 +106,9 @@ async def run_pooled(server_url, routers):
             return seq_results, seq_total, par_results, par_total
 
 
-def print_results(routers, orig_results, orig_total, seq_results, seq_total, par_results, par_total):
+def print_results(
+    routers, orig_results, orig_total, seq_results, seq_total, par_results, par_total
+):
     n_routers = len(routers)
     n_commands = len(COMMANDS)
     n_ops = n_routers * n_commands
@@ -114,7 +116,11 @@ def print_results(routers, orig_results, orig_total, seq_results, seq_total, par
     print()
     print("=" * 110)
     print("JUNOS MCP SERVER — CONNECTION POOL BENCHMARK")
-    print("{} routers x {} commands = {} device operations".format(n_routers, n_commands, n_ops))
+    print(
+        "{} routers x {} commands = {} device operations".format(
+            n_routers, n_commands, n_ops
+        )
+    )
     print("=" * 110)
     print()
 
@@ -158,9 +164,7 @@ def print_results(routers, orig_results, orig_total, seq_results, seq_total, par
     print()
 
     print("CONNECTION OVERHEAD:")
-    print(
-        "  Original: {} SSH handshakes (connect + disconnect per call)".format(n_ops)
-    )
+    print("  Original: {} SSH handshakes (connect + disconnect per call)".format(n_ops))
     print(
         "  Pool:     {} SSH handshakes (reused across all {} calls)".format(
             n_routers, n_ops
@@ -170,7 +174,9 @@ def print_results(routers, orig_results, orig_total, seq_results, seq_total, par
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Junos MCP Server Connection Pool Benchmark")
+    parser = argparse.ArgumentParser(
+        description="Junos MCP Server Connection Pool Benchmark"
+    )
     parser.add_argument(
         "--server",
         default="http://127.0.0.1:30030/mcp",
@@ -203,7 +209,13 @@ def main():
     )
 
     print_results(
-        routers, orig_results, orig_total, seq_results, seq_total, par_results, par_total
+        routers,
+        orig_results,
+        orig_total,
+        seq_results,
+        seq_total,
+        par_results,
+        par_total,
     )
 
 
