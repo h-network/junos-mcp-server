@@ -244,7 +244,6 @@ class ConnectionPool:
                             e,
                         )
                     entry["device"] = None
-            self._connections.clear()
         log.info("Connection pool: all connections closed")
 
     @property
@@ -1462,7 +1461,8 @@ async def handle_get_junos_config(
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug("Getting configuration from router %s", router_name)
-        result = _run_junos_cli_command(
+        result = await anyio.to_thread.run_sync(
+            _run_junos_cli_command,
             router_name,
             "show configuration | display inheritance no-comments | display set | no-more",
         )
@@ -1490,8 +1490,10 @@ async def handle_junos_config_diff(
             router_name,
             version,
         )
-        result = _run_junos_cli_command(
-            router_name, f"show configuration | compare rollback {version}"
+        result = await anyio.to_thread.run_sync(
+            _run_junos_cli_command,
+            router_name,
+            f"show configuration | compare rollback {version}",
         )
 
     content_block = types.TextContent(
