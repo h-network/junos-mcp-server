@@ -141,6 +141,10 @@ Junos MCP server supports both streamable-http and stdio transport. Do not use
 ### Environment Variables
 
 - `JUNOS_TIMEOUT`: Command timeout in seconds for Junos CLI operations.
+- `JMCP_POOL_IDLE_TIMEOUT`: Idle timeout in seconds for pooled SSH/NETCONF connections.
+  - SSH sessions are reused across tool calls via a connection pool; a background
+    cleanup thread (running once a minute) closes connections idle longer than this timeout.
+  - Default: `300`. Invalid values are logged and fall back to the default.
 - `JMCP_STATELESS`: Controls streamable-http session mode.
   - Default: `false` (stateful sessions, required for elicitation workflows such as `add_device`).
   - Accepted true values: `1`, `true`, `yes`, `y`, `on`

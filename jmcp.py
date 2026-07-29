@@ -1690,6 +1690,158 @@ async def handle_render_and_apply_j2_template(
 
     application_results = []
 
+    # Format detection depends only on the rendered config — do it once for all
+    # routers.
+    if config_format_override:
+        config_format = config_format_override
+        await context.info(f"Using explicit config format: {config_format}")
+    else:
+        config_format = "set"
+        for line in rendered_config.strip().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not re.match(r"^(set|delete|deactivate|activate)\s", stripped):
+                config_format = "text"
+                break
+        await context.info(f"Auto-detected config format: {config_format}")
+
+    def _apply_config_sync(rtr_name: str) -> tuple[str, list[tuple[str, str]]]:
+        """Blocking per-router device work, run via anyio.to_thread.run_sync.
+
+        Returns (application-result entry, [(context log level, message), ...]);
+        the async caller replays the messages after the thread returns.
+        """
+        msgs: list[tuple[str, str]] = []
+        with connection_pool.get_connection(rtr_name) as dev:
+            msgs.append(("info", f"Connected to {rtr_name}"))
+            try:
+                with Config(dev, mode="exclusive") as cu:
+                    msgs.append(
+                        (
+                            "info",
+                            f"Loading configuration on {rtr_name} "
+                            f"(format={config_format})...",
+                        )
+                    )
+                    cu.load(rendered_config, format=config_format)
+
+                    diff = cu.diff()
+
+                    if not diff:
+                        result_msg = "No configuration changes detected"
+                        msgs.append(("info", f"{rtr_name}: {result_msg}"))
+                        return f"ℹ️  {rtr_name}: {result_msg}", msgs
+
+                    if dry_run:
+                        msgs.append(
+                            ("info", f"Performing commit check on {rtr_name}...")
+                        )
+                        try:
+                            check_result = cu.commit_check()
+
+                            if not check_result:
+                                result_msg = (
+                                    "Commit check failed - configuration has errors"
+                                )
+                                entry = f"❌ {rtr_name}: {result_msg}"
+                                msgs.append(("error", f"{rtr_name}: {result_msg}"))
+                            else:
+                                result_msg = (
+                                    "Configuration check successful. "
+                                    f"Changes:\n\n{diff}"
+                                )
+                                entry = f"🔍 {rtr_name}: {result_msg}"
+                                msgs.append(
+                                    (
+                                        "info",
+                                        f"{rtr_name}: Dry-run commit check passed",
+                                    )
+                                )
+                        except Exception as check_error:
+                            result_msg = f"Commit check error: {check_error}"
+                            entry = f"❌ {rtr_name}: {result_msg}"
+                            msgs.append(("error", f"{rtr_name}: {result_msg}"))
+                        finally:
+                            msgs.append(
+                                (
+                                    "info",
+                                    f"{rtr_name}: Rolling back changes (dry-run mode)",
+                                )
+                            )
+                            try:
+                                cu.rollback()
+                                diff = cu.diff()
+
+                                if diff:
+                                    msgs.append(
+                                        (
+                                            "error",
+                                            f"{rtr_name}: Rollback verification "
+                                            "failed - unexpected changes remain",
+                                        )
+                                    )
+                                    msgs.append(
+                                        (
+                                            "error",
+                                            f"{rtr_name}: Remaining diff:\n{diff}",
+                                        )
+                                    )
+                                else:
+                                    msgs.append(
+                                        (
+                                            "info",
+                                            f"{rtr_name}: Rollback verified "
+                                            "successfully - no pending changes",
+                                        )
+                                    )
+                            except Exception as rollback_error:
+                                msgs.append(
+                                    (
+                                        "error",
+                                        f"{rtr_name}: Rollback failed with "
+                                        f"error: {str(rollback_error)}",
+                                    )
+                                )
+                        return entry, msgs
+
+                    msgs.append(("info", f"Performing commit check on {rtr_name}..."))
+                    check_result = cu.commit_check()
+
+                    if not check_result:
+                        result_msg = "Commit check failed - configuration has errors"
+                        msgs.append(("error", f"{rtr_name}: {result_msg}"))
+                        cu.rollback()
+                        return f"❌ {rtr_name}: {result_msg}", msgs
+
+                    msgs.append(("info", f"Committing configuration on {rtr_name}..."))
+                    cu.commit(comment=commit_comment)
+                    result_msg = (
+                        f"Configuration committed successfully. Changes:\n\n{diff}"
+                    )
+                    msgs.append(
+                        ("info", f"{rtr_name}: Configuration committed successfully")
+                    )
+                    return f"✅ {rtr_name}: {result_msg}", msgs
+
+            except (ConfigLoadError, CommitError, LockError) as e:
+                # Config.__exit__ released the exclusive lock before this
+                # propagated (a failed unlock raises UnlockError, which is none
+                # of these), so the session is clean and stays pooled.
+                error_msg = f"Configuration error: {e}"
+                msgs.append(("error", f"{rtr_name}: {error_msg}"))
+                return f"❌ {rtr_name}: {error_msg}", msgs
+            except Exception:
+                # Anything else (e.g. UnlockError from Config.__exit__) may leave
+                # the session holding the exclusive config lock. Drop the
+                # transport so the pool evicts it instead of getting back a
+                # possibly-locked session; mirrors _load_and_commit_sync.
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                raise
+
     for rtr_name in router_names:
         if rtr_name not in devices:
             application_results.append(
@@ -1703,169 +1855,28 @@ async def handle_render_and_apply_j2_template(
                 f"{'Checking' if dry_run else 'Applying'} configuration on {rtr_name}..."
             )
 
-            device_info = devices[rtr_name]
-
-            try:
-                connect_params = prepare_connection_params(device_info, rtr_name)
-            except ValueError as ve:
-                application_results.append(f"❌ {rtr_name}: {ve}")
-                await context.error(f"{rtr_name}: {ve}")
-                continue
-
-            dev = Device(**connect_params)
-
-            try:
-                dev.open()
-                await context.info(f"Connected to {rtr_name}")
-
-                if config_format_override:
-                    config_format = config_format_override
-                    await context.info(f"Using explicit config format: {config_format}")
-                else:
-                    config_format = "set"
-                    for line in rendered_config.strip().splitlines():
-                        stripped = line.strip()
-                        if not stripped or stripped.startswith("#"):
-                            continue
-                        if not re.match(
-                            r"^(set|delete|deactivate|activate)\s", stripped
-                        ):
-                            config_format = "text"
-                            break
-                    await context.info(f"Auto-detected config format: {config_format}")
-
-                try:
-                    with Config(dev, mode="exclusive") as cu:
-                        await context.info(
-                            f"Loading configuration on {rtr_name} "
-                            f"(format={config_format})..."
-                        )
-                        cu.load(rendered_config, format=config_format)
-
-                        diff = cu.diff()
-
-                        if not diff:
-                            result_msg = "No configuration changes detected"
-                            application_results.append(f"ℹ️  {rtr_name}: {result_msg}")
-                            await context.info(f"{rtr_name}: {result_msg}")
-                        else:
-                            if dry_run:
-                                await context.info(
-                                    f"Performing commit check on {rtr_name}..."
-                                )
-
-                                try:
-                                    check_result = cu.commit_check()
-
-                                    if not check_result:
-                                        result_msg = (
-                                            "Commit check failed - "
-                                            "configuration has errors"
-                                        )
-                                        application_results.append(
-                                            f"❌ {rtr_name}: {result_msg}"
-                                        )
-                                        await context.error(f"{rtr_name}: {result_msg}")
-                                    else:
-                                        result_msg = (
-                                            "Configuration check successful. "
-                                            f"Changes:\n\n{diff}"
-                                        )
-                                        application_results.append(
-                                            f"🔍 {rtr_name}: {result_msg}"
-                                        )
-                                        await context.info(
-                                            f"{rtr_name}: Dry-run commit check passed"
-                                        )
-
-                                except Exception as check_error:
-                                    result_msg = f"Commit check error: {check_error}"
-                                    application_results.append(
-                                        f"❌ {rtr_name}: {result_msg}"
-                                    )
-                                    await context.error(f"{rtr_name}: {result_msg}")
-                                finally:
-                                    await context.info(
-                                        f"{rtr_name}: Rolling back changes (dry-run mode)"
-                                    )
-                                    try:
-                                        cu.rollback()
-                                        diff = cu.diff()
-
-                                        if diff:
-                                            await context.error(
-                                                f"{rtr_name}: Rollback verification "
-                                                "failed - unexpected changes remain"
-                                            )
-                                            await context.error(
-                                                f"{rtr_name}: Remaining diff:\n{diff}"
-                                            )
-                                        else:
-                                            await context.info(
-                                                f"{rtr_name}: Rollback verified "
-                                                "successfully - no pending changes"
-                                            )
-
-                                    except Exception as rollback_error:
-                                        await context.error(
-                                            f"{rtr_name}: Rollback failed with "
-                                            f"error: {str(rollback_error)}"
-                                        )
-                            else:
-                                await context.info(
-                                    f"Performing commit check on {rtr_name}..."
-                                )
-                                check_result = cu.commit_check()
-
-                                if not check_result:
-                                    result_msg = (
-                                        "Commit check failed - configuration has errors"
-                                    )
-                                    application_results.append(
-                                        f"❌ {rtr_name}: {result_msg}"
-                                    )
-                                    await context.error(f"{rtr_name}: {result_msg}")
-                                    cu.rollback()
-                                else:
-                                    await context.info(
-                                        f"Committing configuration on {rtr_name}..."
-                                    )
-                                    cu.commit(comment=commit_comment)
-                                    result_msg = (
-                                        "Configuration committed successfully. "
-                                        f"Changes:\n\n{diff}"
-                                    )
-                                    application_results.append(
-                                        f"✅ {rtr_name}: {result_msg}"
-                                    )
-                                    await context.info(
-                                        f"{rtr_name}: Configuration committed successfully"
-                                    )
-
-                except (ConfigLoadError, CommitError, LockError) as e:
-                    error_msg = f"Configuration error: {e}"
-                    application_results.append(f"❌ {rtr_name}: {error_msg}")
-                    await context.error(f"{rtr_name}: {error_msg}")
-
-            except ConnectError as e:
-                error_msg = f"Connection failed: {e}"
-                application_results.append(f"❌ {rtr_name}: {error_msg}")
-                await context.error(f"{rtr_name}: {error_msg}")
-            finally:
-                try:
-                    dev.close()
-                    await context.info(f"Disconnected from {rtr_name}")
-                except Exception as close_error:
-                    log.warning(
-                        "Error while closing test connection to %s: %s",
-                        rtr_name,
-                        close_error,
-                    )
-
+            entry, msgs = await anyio.to_thread.run_sync(_apply_config_sync, rtr_name)
+        except ValueError as ve:
+            application_results.append(f"❌ {rtr_name}: {ve}")
+            await context.error(f"{rtr_name}: {ve}")
+            continue
+        except ConnectError as e:
+            error_msg = f"Connection failed: {e}"
+            application_results.append(f"❌ {rtr_name}: {error_msg}")
+            await context.error(f"{rtr_name}: {error_msg}")
+            continue
         except Exception as e:
             error_msg = f"Failed to apply configuration: {e}"
             application_results.append(f"❌ {rtr_name}: {error_msg}")
             await context.error(f"{rtr_name}: {error_msg}")
+            continue
+
+        for level, message in msgs:
+            if level == "error":
+                await context.error(message)
+            else:
+                await context.info(message)
+        application_results.append(entry)
 
     summary = "\n".join(application_results)
 

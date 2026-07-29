@@ -54,7 +54,7 @@ The server implements 11 MCP tools in `jmcp.py`:
 
 ### Key Implementation Details
 
-- Most device-accessing handlers borrow from the thread-safe `ConnectionPool` (`connection_pool.get_connection`) and dispatch PyEZ's blocking calls off the async event loop with `anyio.to_thread.run_sync` (e.g. `execute_junos_command`/`_batch`, `get_junos_config`, `gather_device_facts`, `load_and_commit_config`). Two paths intentionally do not: `render_and_apply_j2_template` opens a direct, non-pooled session and runs inline (pooling it is deferred to a follow-up), and the `add_device` connectivity check makes a one-off probe of a not-yet-registered device.
+- Most device-accessing handlers borrow from the thread-safe `ConnectionPool` (`connection_pool.get_connection`) and dispatch PyEZ's blocking calls off the async event loop with `anyio.to_thread.run_sync` (e.g. `execute_junos_command`/`_batch`, `get_junos_config`, `gather_device_facts`, `load_and_commit_config`, `render_and_apply_j2_template`). One path intentionally does not: the `add_device` connectivity check makes a one-off probe of a not-yet-registered device.
 - Idle pooled connections are closed after `JMCP_POOL_IDLE_TIMEOUT` seconds (default 300)
 - Connection parameters are prepared by `prepare_connection_params` which handles both password and SSH key authentication
 - Default timeout is 360 seconds for long-running operations
