@@ -38,7 +38,7 @@ docker run --rm -it -v /path/to/devices.json:/app/config/devices.json -p 30030:3
 
 ## Architecture
 
-The server implements 11 MCP tools in `jmcp.py`:
+The server implements 9 MCP tools in `jmcp.py`:
 
 1. **execute_junos_command** - Execute arbitrary CLI commands on routers
 2. **execute_junos_command_batch** - Execute the same command on multiple routers in parallel
@@ -49,12 +49,12 @@ The server implements 11 MCP tools in `jmcp.py`:
 7. **gather_device_facts** - Collect device information using PyEZ facts
 8. **get_router_list** - List available routers from the configuration
 9. **load_and_commit_config** - Apply configuration changes (supports set/text/xml formats)
-10. **add_device** - Add a device to the in-memory mapping at runtime
-11. **reload_devices** - Reload the device mapping from a new JSON file
+
+Device inventory is defined solely by the JSON mapping file loaded and validated at startup. The former `add_device` and `reload_devices` runtime device-management tools were removed for security reasons (see `.commit-logs.txt`): they let any MCP client register attacker-controlled hosts, probe arbitrary IP:port pairs, and swap the device map from arbitrary server file paths.
 
 ### Key Implementation Details
 
-- Most device-accessing handlers borrow from the thread-safe `ConnectionPool` (`connection_pool.get_connection`) and dispatch PyEZ's blocking calls off the async event loop with `anyio.to_thread.run_sync` (e.g. `execute_junos_command`/`_batch`, `get_junos_config`, `gather_device_facts`, `load_and_commit_config`, `render_and_apply_j2_template`). One path intentionally does not: the `add_device` connectivity check makes a one-off probe of a not-yet-registered device.
+- Device-accessing handlers borrow from the thread-safe `ConnectionPool` (`connection_pool.get_connection`) and dispatch PyEZ's blocking calls off the async event loop with `anyio.to_thread.run_sync` (e.g. `execute_junos_command`/`_batch`, `get_junos_config`, `gather_device_facts`, `load_and_commit_config`, `render_and_apply_j2_template`).
 - Idle pooled connections are closed after `JMCP_POOL_IDLE_TIMEOUT` seconds (default 300)
 - Connection parameters are prepared by `prepare_connection_params` which handles both password and SSH key authentication
 - Default timeout is 360 seconds for long-running operations

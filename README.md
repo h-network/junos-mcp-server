@@ -23,14 +23,6 @@ LLM interactions with network equipment.
     - [Running with Default Settings](#running-with-default-settings)
     - [Overriding Default Arguments](#overriding-default-arguments)
   - [Junos Device Configuration](#junos-device-configuration)
-  - [Dynamic Device Management with Elicitation](#dynamic-device-management-with-elicitation)
-    - [Elicitation Compatibility Notice](#elicitation-compatibility-notice)
-    - [The `add_device` Tool](#the-add_device-tool)
-      - [How It Works](#how-it-works)
-      - [Security Note](#security-note)
-      - [Example Usage](#example-usage)
-      - [SSH Key Requirements](#ssh-key-requirements)
-      - [Limitations](#limitations)
   - [VSCode + GitHub Copilot Integration](#vscode--github-copilot-integration)
     - [Start Your Server](#start-your-server)
     - [Point to This URL in Your VSCode Config](#point-to-this-url-in-your-vscode-config)
@@ -59,7 +51,6 @@ LLM interactions with network equipment.
       - [Step 2: Register the Handler](#step-2-register-the-handler)
       - [Step 3: Define Tool Metadata](#step-3-define-tool-metadata)
     - [Example: Creating a BGP Neighbors Tool](#example-creating-a-bgp-neighbors-tool)
-    - [Using Elicitation in Tools](#using-elicitation-in-tools)
     - [Best Practices for Tool Development](#best-practices-for-tool-development)
     - [Using PyEZ for Advanced Operations](#using-pyez-for-advanced-operations)
     - [Testing Your Tools](#testing-your-tools)
@@ -145,10 +136,6 @@ Junos MCP server supports both streamable-http and stdio transport. Do not use
   - SSH sessions are reused across tool calls via a connection pool; a background
     cleanup thread (running once a minute) closes connections idle longer than this timeout.
   - Default: `300`. Invalid values are logged and fall back to the default.
-- `JMCP_STATELESS`: Controls streamable-http session mode.
-  - Default: `false` (stateful sessions, required for elicitation workflows such as `add_device`).
-  - Accepted true values: `1`, `true`, `yes`, `y`, `on`
-  - Accepted false values: `0`, `false`, `no`, `n`, `off`
 
 ## Configuration
 
@@ -246,16 +233,6 @@ junos-mcp-server:latest python jmcp.py -f /app/config/devices.json -t stdio
 
 ```bash
 docker run --rm -it \
-  -v /path/to/your/devices.json:/app/config/devices.json \
-  -v /path/to/.tokens:/app/.tokens \
-  -p 30030:30030 \
-  junos-mcp-server:latest \
-  python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
-```
-
-**For streamable-http in stateless mode:**
-```bash
-$ docker run --rm -it -e JMCP_STATELESS=true \
   -v /path/to/your/devices.json:/app/config/devices.json \
   -v /path/to/.tokens:/app/.tokens \
   -p 30030:30030 \
@@ -372,90 +349,6 @@ Host dt-crpd1 dtwin-crpd1 digital-twin-crpd1 clab-digital-twin-eop6-pe1
 
 **Note #2:** `IdentityFile` recommendation use full path (e.g `/home/user/.ssh
 /id_rsa_claude` rather than `~/.ssh/id_rsa_claude`).
-
-## Dynamic Device Management with Elicitation
-
-### Elicitation Compatibility Notice
-
-> **Important:** The elicitation feature currently only works with **VSCode** (using streamable-http transport). Claude Desktop does not yet support elicitation, so the `add_device` tool will not work with Claude Desktop.
-
-### The `add_device` Tool
-
-The Junos MCP server includes a powerful `add_device` tool that allows you to
-dynamically add new Junos devices without modifying the configuration file.
-This tool uses MCP's elicitation feature to interactively collect device
-information.
-
-#### How It Works
-
-When you use the `add_device` tool, it will interactively ask for:
-
-1. **Device Name**: A unique identifier for your device (e.g., "router1-east")
-2. **IP Address**: The device's IP address
-3. **SSH Port**: The SSH port (defaults to 22)
-4. **Username**: The username for authentication
-5. **SSH Key Path**: The path to the SSH private key file on the MCP server
-
-The tool validates each input:
-
-- Device names must be unique
-- IP addresses must be valid
-- SSH key files must exist and be readable
-- Optional connection test before adding the device
-
-#### Security Note
-
-The `add_device` tool **only supports SSH key authentication**. Password
-authentication has been disabled for security reasons and because VSCode's
-elicitation UI doesn't properly mask password fields.
-
-#### Example Usage
-
-In VSCode with GitHub Copilot:
-
-```text
-@jmcp Please add a new device to the MCP server
-```
-
-The tool will then guide you through the process:
-
-1. **Enter device name**: `vsrx-lab1`
-2. **Enter IP address**: `10.0.1.100`
-3. **Enter SSH port**: `22` (or press Enter for default)
-4. **Enter username**: `admin`
-5. **Enter SSH key path**: `/home/user/.ssh/junos_key.pem`
-6. **Confirm and optionally test connection**
-
-After successful addition, the device is immediately available for use with all
-other Junos MCP tools.
-
-#### SSH Key Requirements
-
-- The SSH private key file must exist on the MCP server filesystem
-- The file must be readable by the process running the MCP server
-- For Docker deployments, mount the SSH key file into the container
-
-Example Docker mount:
-
-```bash
-docker run --rm -it \
-  -v /path/to/devices.json:/app/config/devices.json \
-  -v /path/to/ssh_key.pem:/app/config/ssh_key.pem \
-  -p 30030:30030 \
-  junos-mcp-server:latest \
-  python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
-```
-
-#### Limitations
-
-- **VSCode Only**: Elicitation is not supported in Claude Desktop
-- **SSH Key Only**: No password authentication support
-- **No Persistence**: Added devices are only stored in memory; they will be
-lost when the server restarts
-- **Timeout**: Users have 5 minutes to respond to each prompt
-
-For Claude Desktop users, devices must still be configured in the `devices.json`
-file as described in the [Junos device config](#junos-device-configuration) section.
 
 ## VSCode + GitHub Copilot Integration
 
@@ -825,8 +718,6 @@ TOOL_HANDLERS = {
     "gather_device_facts": handle_gather_device_facts,
     "get_router_list": handle_get_router_list,
     "load_and_commit_config": handle_load_and_commit_config,
-    "add_device": handle_add_device,      # Dynamic device management with
-    elicitation
     "my_new_tool": handle_my_new_tool,    # Add your tool here
 }
 ```
@@ -899,43 +790,6 @@ types.Tool(
 )
 ```
 
-### Using Elicitation in Tools
-
-The MCP server supports elicitation for interactive data collection. To use
-elicitation in your tools:
-
-```python
-from mcp.server.elicitation import ElicitationResult
-from pydantic import BaseModel, Field
-
-# Define elicitation schema
-class MyInputSchema(BaseModel):
-    user_input: str = Field(description="Enter your input")
-
-async def handle_my_elicitation_tool(arguments: dict, context: Context) -> list
-[types.ContentBlock]:
-    """Tool that uses elicitation to collect user input"""
-
-    # Use elicitation to ask for user input
-    result = await context.elicit(
-        message="Please provide the required input:",
-        schema=MyInputSchema
-    )
-
-    # Handle the result
-    match result:
-        case AcceptedElicitation(data=data):
-            user_input = data.user_input
-            # Process the input...
-            return [types.TextContent(type="text", text=f"Processing:
-            {user_input}")]
-        case DeclinedElicitation() | CancelledElicitation():
-            return [types.TextContent(type="text", text="Operation cancelled")]
-```
-
-**Note**: Elicitation currently only works with VSCode (streamable-http
-transport). Claude Desktop does not support elicitation yet.
-
 ### Best Practices for Tool Development
 
 1. **Error Handling**: Always handle connection errors and invalid inputs
@@ -945,9 +799,8 @@ gracefully
 4. **Documentation**: Write clear descriptions for tools and parameters
 5. **Timeouts**: Support configurable timeouts for long-running operations
 6. **Return Format**: Always return `list[types.ContentBlock]` with text content
-7. **Elicitation**: Use elicitation for interactive data collection when needed
-8. **Context Parameter**: Include `context: Context` parameter if using
-elicitation
+7. **Context Parameter**: Use the `context: Context` parameter to send progress
+and log messages to the client
 
 ### Using PyEZ for Advanced Operations
 
