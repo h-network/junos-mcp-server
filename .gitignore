@@ -59,3 +59,11 @@ devices.json
 
 # Power point files
 *.pptx
+# Local commit-log scratch file
+.commit-logs.txt
+
+# Claude Code local settings and scratch worktrees
+.claude/
+
+# VSCode local workspace settings
+.vscode/
