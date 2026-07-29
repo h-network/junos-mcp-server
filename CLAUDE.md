@@ -32,25 +32,31 @@ docker run --rm -it -v /path/to/devices.json:/app/config/devices.json -p 30030:3
 
 ### Testing and Development
 
-- No automated tests are currently configured
-- No linting configuration is present
-- Manual testing requires a valid Junos device configuration in JSON format
+- Run the unit tests with `make test` (or `python -m unittest discover -s tests -v`)
+- Code style is enforced with Black (configured in `pyproject.toml`); check with `black --check .` and auto-format with `black .`. CI runs Black and the unit tests (`.github/workflows/ci.yml`).
+- Live testing against devices requires a valid Junos device configuration in JSON format
 
 ## Architecture
 
-The server implements six MCP tools in `jmcp.py`:
+The server implements 11 MCP tools in `jmcp.py`:
 
 1. **execute_junos_command** - Execute arbitrary CLI commands on routers
-2. **get_junos_config** - Retrieve device configuration (uses `show configuration | display inheritance no-comments`)
-3. **junos_config_diff** - Compare configuration versions (rollback comparison)
-4. **gather_device_facts** - Collect device information using PyEZ facts
-5. **get_router_list** - List available routers from the configuration
-6. **load_and_commit_config** - Apply configuration changes (supports set/text/xml formats)
+2. **execute_junos_command_batch** - Execute the same command on multiple routers in parallel
+3. **execute_junos_pfe_command** - Execute a PFE (packet forwarding engine) command on an FPC
+4. **get_junos_config** - Retrieve device configuration (uses `show configuration | display inheritance no-comments`)
+5. **junos_config_diff** - Compare configuration versions (rollback comparison)
+6. **render_and_apply_j2_template** - Render a Jinja2 template and load/commit it
+7. **gather_device_facts** - Collect device information using PyEZ facts
+8. **get_router_list** - List available routers from the configuration
+9. **load_and_commit_config** - Apply configuration changes (supports set/text/xml formats)
+10. **add_device** - Add a device to the in-memory mapping at runtime
+11. **reload_devices** - Reload the device mapping from a new JSON file
 
 ### Key Implementation Details
 
-- All device connections use the `_run_junos_cli_command` helper function (jmcp.py:81)
-- Connection parameters are prepared by `prepare_connection_params` (jmcp.py:42) which handles both password and SSH key authentication
+- Most device-accessing handlers borrow from the thread-safe `ConnectionPool` (`connection_pool.get_connection`) and dispatch PyEZ's blocking calls off the async event loop with `anyio.to_thread.run_sync` (e.g. `execute_junos_command`/`_batch`, `get_junos_config`, `gather_device_facts`, `load_and_commit_config`). Two paths intentionally do not: `render_and_apply_j2_template` opens a direct, non-pooled session and runs inline (pooling it is deferred to a follow-up), and the `add_device` connectivity check makes a one-off probe of a not-yet-registered device.
+- Idle pooled connections are closed after `JMCP_POOL_IDLE_TIMEOUT` seconds (default 300)
+- Connection parameters are prepared by `prepare_connection_params` which handles both password and SSH key authentication
 - Default timeout is 360 seconds for long-running operations
 - The server uses FastMCP for the MCP protocol implementation
 - Device configurations are loaded from a JSON file at startup
@@ -85,7 +91,7 @@ The device configuration file must follow this structure:
 
 When modifying the server:
 
-1. **Adding new tools**: Follow the existing pattern using `@mcp.tool()` decorator
+1. **Adding new tools**: Register the handler in the `TOOL_HANDLERS` dict and declare its schema in `list_tools()`. A single `@app.call_tool()` dispatcher routes calls by name — there are no per-tool `@mcp.tool()` decorators, so a handler that isn't in `TOOL_HANDLERS` is never invoked.
 2. **Error handling**: Use try/except blocks around device operations to catch ConnectError and general exceptions
 3. **Authentication**: Any changes must support both password and SSH key authentication types
 4. **Logging**: Use the global `log` logger for debugging (`logging.getLogger('jmcp-server')`)

@@ -26,7 +26,9 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,7 +39,13 @@ import mcp.types as types
 import yaml
 from jinja2 import Environment, TemplateError
 from jnpr.junos import Device
-from jnpr.junos.exception import ConnectError, ConfigLoadError, CommitError, LockError
+from jnpr.junos.exception import (
+    ConnectError,
+    ConfigLoadError,
+    CommitError,
+    LockError,
+    RpcTimeoutError,
+)
 from jnpr.junos.utils.config import Config
 from mcp.server.elicitation import (
     AcceptedElicitation,
@@ -78,6 +86,227 @@ devices = {}
 
 # Junos MCP Server
 JUNOS_MCP = "jmcp-server"
+
+
+class ConnectionPool:
+    """Thread-safe SSH connection pool for Junos devices.
+
+    Reuses SSH sessions across tool calls instead of opening a new connection
+    for every command. Idle connections are closed after a configurable timeout
+    (default 300s, configurable via JMCP_POOL_IDLE_TIMEOUT env var).
+    """
+
+    def __init__(self, idle_timeout: int | None = None):
+        self._connections: dict[str, dict] = {}
+        self._pool_lock = threading.Lock()
+        if idle_timeout is None:
+            self._idle_timeout = 300
+            env_val = os.getenv("JMCP_POOL_IDLE_TIMEOUT")
+            if env_val is not None:
+                try:
+                    self._idle_timeout = int(env_val)
+                except ValueError:
+                    log.warning(
+                        "Invalid JMCP_POOL_IDLE_TIMEOUT environment variable "
+                        "value: %s. Using default idle timeout.",
+                        env_val,
+                    )
+        else:
+            self._idle_timeout = idle_timeout
+        self._running = True
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, daemon=True, name="pool-cleanup"
+        )
+        self._cleanup_thread.start()
+        log.info("Connection pool initialized (idle_timeout=%ds)", self._idle_timeout)
+
+    @contextmanager
+    def get_connection(self, router_name: str, timeout: int = 360):
+        """Get a pooled device connection. Creates or reuses as needed.
+
+        Args:
+            router_name: Name of the router (must exist in devices dict)
+            timeout: Command timeout to set on the device
+
+        Yields:
+            An open jnpr.junos.Device instance
+
+        Raises:
+            ValueError: If connection params are invalid
+            ConnectError: If SSH connection fails
+
+        Note:
+            Handlers reach the pool via anyio.to_thread.run_sync, which shares
+            anyio's process-wide default thread limiter (40 tokens). A batch
+            over >40 routers, or 40+ concurrent same-router calls, will queue at
+            that ceiling; the per-router lock below also serializes same-router
+            work.
+        """
+        entry = self._get_or_create_entry(router_name)
+        entry["lock"].acquire()
+        try:
+            device = entry["device"]
+            if device is None or not device.connected:
+                if device is not None:
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                    entry["device"] = None
+                device_info = devices[router_name]
+                connect_params = prepare_connection_params(device_info, router_name)
+                device = Device(**connect_params)
+                try:
+                    device.open()
+                except Exception:
+                    # open() may have partially established the transport before
+                    # raising; close the local device so we don't leak it (it was
+                    # never stored in entry["device"], so the except block below
+                    # would not see it).
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                    raise
+                entry["device"] = device
+                log.info("Pool: opened new connection to %s", router_name)
+            else:
+                log.debug("Pool: reusing connection to %s", router_name)
+
+            device.timeout = timeout
+            yield device
+        except Exception as exc:
+            # Invalidate the pooled connection if it is no longer usable: either
+            # the transport dropped (not connected), or an RPC timed out.
+            # RpcTimeoutError leaves device.connected True but the session is no
+            # longer reliable; pre-pooling, every call opened a fresh session so
+            # a timeout never poisoned later calls — evict to preserve that.
+            dev = entry["device"]
+            if dev is not None and (
+                not dev.connected or isinstance(exc, RpcTimeoutError)
+            ):
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                entry["device"] = None
+            raise
+        finally:
+            # Refresh last_used on every borrow — success OR failure. Otherwise a
+            # connection whose operation raised while still connected keeps
+            # last_used at 0.0, and the idle-cleanup loop (which requires
+            # last_used > 0) would never reap it.
+            entry["last_used"] = time.time()
+            entry["lock"].release()
+
+    def _get_or_create_entry(self, router_name: str) -> dict:
+        with self._pool_lock:
+            if router_name not in self._connections:
+                self._connections[router_name] = {
+                    "device": None,
+                    "lock": threading.Lock(),
+                    "last_used": 0.0,
+                }
+            return self._connections[router_name]
+
+    def _cleanup_loop(self):
+        while self._running:
+            time.sleep(60)
+            self._cleanup_idle()
+
+    def _cleanup_idle(self):
+        now = time.time()
+        # Collect idle candidates under the global lock, then close OUTSIDE it.
+        # Holding _pool_lock across a blocking device.close() (a black-holed
+        # device can stall on TCP/SSH timeout) would freeze every router's
+        # borrow, since get_connection() needs the same lock. Mirrors close_all.
+        candidates = []
+        with self._pool_lock:
+            for router_name, entry in self._connections.items():
+                if (
+                    entry["device"] is not None
+                    and entry["last_used"] > 0
+                    and (now - entry["last_used"]) > self._idle_timeout
+                ):
+                    candidates.append((router_name, entry))
+        for router_name, entry in candidates:
+            # Non-blocking: skip entries currently in use this cycle.
+            if not entry["lock"].acquire(blocking=False):
+                continue
+            try:
+                # Re-check under the lock: the entry may have been used or closed
+                # between collection and acquiring the lock.
+                if (
+                    entry["device"] is not None
+                    and entry["last_used"] > 0
+                    and (now - entry["last_used"]) > self._idle_timeout
+                ):
+                    try:
+                        entry["device"].close()
+                    except Exception as e:
+                        log.debug(
+                            "Pool: error closing idle connection to %s: %s",
+                            router_name,
+                            e,
+                        )
+                    entry["device"] = None
+                    log.info(
+                        "Pool: closed idle connection to %s (idle %.0fs)",
+                        router_name,
+                        now - entry["last_used"],
+                    )
+            finally:
+                entry["lock"].release()
+
+    def close_all(self, shutdown: bool = True):
+        """Close all pooled connections.
+
+        Args:
+            shutdown: If True (default), also stop the idle-cleanup thread —
+                use on server shutdown. If False, drop all connections but
+                keep the pool operational (cleanup thread keeps running) —
+                use on device reload, where configs changed but the pool
+                must keep serving.
+        """
+        if shutdown:
+            self._running = False
+        # Snapshot entries under the global lock, then close each under its own
+        # per-router lock (outside the global lock, so a slow close can't block
+        # unrelated routers). Do NOT clear _connections: clearing would detach an
+        # entry that an in-flight get_connection() borrow already holds, leaving
+        # the connection it is about to open untracked and never reaped. Leaving
+        # device=None entries behind is cheap and keeps every connection
+        # reapable.
+        with self._pool_lock:
+            entries = list(self._connections.items())
+        for router_name, entry in entries:
+            if shutdown:
+                # Shutdown: don't wait on an in-flight op (the process is exiting
+                # and the OS reclaims sockets) — skip busy entries so SIGTERM
+                # during a long command doesn't hang teardown.
+                if not entry["lock"].acquire(blocking=False):
+                    continue
+            else:
+                # Reload: wait for in-flight ops so we don't sever a live RPC.
+                entry["lock"].acquire()
+            try:
+                if entry["device"] is not None:
+                    try:
+                        entry["device"].close()
+                    except Exception as e:
+                        log.debug(
+                            "Pool: error closing connection to %s: %s",
+                            router_name,
+                            e,
+                        )
+                    entry["device"] = None
+            finally:
+                entry["lock"].release()
+        log.info("Connection pool: all connections closed")
+
+
+# Global connection pool instance
+connection_pool = ConnectionPool()
 
 
 class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
@@ -648,23 +877,19 @@ The device is now available for use with all Junos MCP tools."""
 
 
 def _run_junos_cli_command(router_name: str, command: str, timeout: int = 360) -> str:
-    """Internal helper to connect and run a Junos CLI command."""
+    """Internal helper to run a Junos CLI command using the connection pool."""
     log.debug(
         "Executing command %s on router %s with timeout %ss (internal)",
         command,
         router_name,
         timeout,
     )
-    device_info = devices[router_name]
     try:
-        connect_params = prepare_connection_params(device_info, router_name)
-    except ValueError as ve:
-        return f"Error: {ve}"
-    try:
-        with Device(**connect_params) as junos_device:
-            junos_device.timeout = timeout
+        with connection_pool.get_connection(router_name, timeout) as junos_device:
             op = junos_device.cli(command, warning=False)
             return op
+    except ValueError as ve:
+        return f"Error: {ve}"
     except ConnectError as ce:
         return f"Connection error to {router_name}: {ce}"
     except Exception as e:
@@ -686,17 +911,13 @@ def _run_junos_pfe_command(
         router_name,
         timeout,
     )
-    device_info = devices[router_name]
     try:
-        connect_params = prepare_connection_params(device_info, router_name)
-    except ValueError as ve:
-        return f"Error: {ve}"
-    try:
-        with Device(**connect_params) as junos_device:
-            junos_device.timeout = timeout
+        with connection_pool.get_connection(router_name, timeout) as junos_device:
             op = junos_device.rpc.request_pfe_execute(target=target, command=command)
             result_text = op.text if hasattr(op, "text") else str(op)
             return {target: result_text}
+    except ValueError as ve:
+        return f"Error: {ve}"
     except ConnectError as ce:
         return f"Connection error to {router_name}: {ce}"
     except Exception as e:
@@ -1001,7 +1222,9 @@ async def handle_execute_junos_command(
             router_name,
             timeout,
         )
-        result = _run_junos_cli_command(router_name, command, timeout)
+        result = await anyio.to_thread.run_sync(
+            _run_junos_cli_command, router_name, command, timeout
+        )
 
     end_time = time.time()
     end_timestamp = datetime.now(timezone.utc).isoformat()
@@ -1051,7 +1274,10 @@ async def handle_execute_junos_command_batch(
     import asyncio
 
     batch_start_time = time.time()
-    router_names = arguments.get("router_names", [])
+    # Dedupe while preserving order: with the connection pool, repeated routers
+    # share one per-router lock and would run serially (and waste worker
+    # threads) instead of in parallel.
+    router_names = list(dict.fromkeys(arguments.get("router_names", [])))
     command = arguments.get("command", "")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
 
@@ -1284,7 +1510,8 @@ async def handle_get_junos_config(
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug("Getting configuration from router %s", router_name)
-        result = _run_junos_cli_command(
+        result = await anyio.to_thread.run_sync(
+            _run_junos_cli_command,
             router_name,
             "show configuration | display inheritance no-comments | display set | no-more",
         )
@@ -1312,8 +1539,10 @@ async def handle_junos_config_diff(
             router_name,
             version,
         )
-        result = _run_junos_cli_command(
-            router_name, f"show configuration | compare rollback {version}"
+        result = await anyio.to_thread.run_sync(
+            _run_junos_cli_command,
+            router_name,
+            f"show configuration | compare rollback {version}",
         )
 
     content_block = types.TextContent(
@@ -1676,33 +1905,30 @@ async def handle_gather_device_facts(
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug("Getting facts from router %s with timeout %ss", router_name, timeout)
-        device_info = devices[router_name]
+
+        def _gather_facts_sync() -> str:
+            with connection_pool.get_connection(router_name, timeout) as junos_device:
+                junos_device.facts_refresh()
+                facts_dict = dict(junos_device.facts)
+
+                def json_serializer(obj):
+                    if hasattr(obj, "_asdict"):
+                        return obj._asdict()
+                    elif hasattr(obj, "__dict__"):
+                        return obj.__dict__
+                    else:
+                        return str(obj)
+
+                return json.dumps(facts_dict, indent=2, default=json_serializer)
+
         try:
-            connect_params = prepare_connection_params(device_info, router_name)
-            connect_params["timeout"] = timeout
+            result = await anyio.to_thread.run_sync(_gather_facts_sync)
         except ValueError as ve:
             result = f"Error: {ve}"
-        else:
-            try:
-                with Device(**connect_params) as junos_device:
-                    facts = junos_device.facts
-                    # Convert _FactCache to a regular dict
-                    facts_dict = dict(facts)
-
-                    # Custom JSON encoder to handle version_info and other complex objects
-                    def json_serializer(obj):
-                        if hasattr(obj, "_asdict"):  # Named tuples like version_info
-                            return obj._asdict()
-                        elif hasattr(obj, "__dict__"):  # Objects with __dict__
-                            return obj.__dict__
-                        else:
-                            return str(obj)
-
-                    result = json.dumps(facts_dict, indent=2, default=json_serializer)
-            except ConnectError as ce:
-                result = f"Connection error to {router_name}: {ce}"
-            except Exception as e:
-                result = f"An error occurred: {e}"
+        except ConnectError as ce:
+            result = f"Connection error to {router_name}: {ce}"
+        except Exception as e:
+            result = f"An error occurred: {e}"
 
     content_block = types.TextContent(
         type="text", text=result, annotations={"router_name": router_name}
@@ -1746,8 +1972,19 @@ async def handle_reload_devices(
         ]
 
     old_count = len(devices)
+    # Swap the device map FIRST, then drop the old pooled connections. close_all
+    # snapshots entries under the pool's global lock and closes each once its
+    # per-router lock frees, so no old-config connection is leaked past the
+    # reset. (A borrow already in flight may still complete one op on the
+    # previous config, and a router dropped mid-reload can raise KeyError from
+    # devices[...], which is caught and returned as an error string, not a
+    # crash.) Run close_all in a worker thread so its blocking device.close()
+    # calls don't stall the event loop; it keeps the pool and cleanup thread
+    # alive.
     devices = new_devices
     new_count = len(devices)
+
+    await anyio.to_thread.run_sync(connection_pool.close_all, False)
 
     log.info(
         "Reloaded devices from '%s': %s -> %s device(s)",
@@ -1830,8 +2067,8 @@ async def handle_execute_pfe_command(
             router_name,
             timeout,
         )
-        result = _run_junos_pfe_command(
-            router_name, target=target, command=command, timeout=timeout
+        result = await anyio.to_thread.run_sync(
+            _run_junos_pfe_command, router_name, target, command, timeout
         )
         if isinstance(result, dict):
             # Normal case: RPC succeeded, result is a dict keyed by target
@@ -1889,76 +2126,65 @@ async def handle_load_and_commit_config(
             router_name,
             config_format,
         )
-        device_info = devices[router_name]
+
+        def _load_and_commit_sync() -> str:
+            with connection_pool.get_connection(router_name, timeout) as junos_device:
+                config_util = Config(junos_device)
+                try:
+                    config_util.lock()
+                except Exception as e:
+                    return f"Failed to lock configuration: {e}"
+
+                try:
+                    fmt = config_format.lower()
+                    if fmt in ("set", "text", "xml"):
+                        config_util.load(config_text, format=fmt)
+                    else:
+                        config_util.unlock()
+                        return (
+                            f"Error: Unsupported config format "
+                            f"'{config_format}'. Use 'set', 'text', or 'xml'"
+                        )
+
+                    diff = config_util.diff()
+                    if not diff:
+                        config_util.unlock()
+                        return "No configuration changes detected"
+
+                    config_util.commit(comment=commit_comment, timeout=timeout)
+                    config_util.unlock()
+                    return (
+                        "Configuration successfully loaded and "
+                        f"committed on {router_name}. Changes:\n{diff}"
+                    )
+                except Exception as e:
+                    try:
+                        config_util.rollback()
+                        config_util.unlock()
+                    except Exception:
+                        # Cleanup failed for ANY reason (e.g. unlock() raising
+                        # UnlockError, or rollback() a bare RpcError — neither a
+                        # subclass of the previously-allowlisted types): this
+                        # session may still hold the config lock. Drop the
+                        # transport so the pool evicts it (via the
+                        # `not device.connected` check in get_connection) instead
+                        # of returning a locked session that fails every later
+                        # commit with "database is locked". Classifying the
+                        # failure is the outer `except Exception as e`'s job.
+                        try:
+                            junos_device.close()
+                        except Exception:
+                            pass
+                    return f"Failed to load/commit configuration: {e}"
 
         try:
-            connect_params = prepare_connection_params(device_info, router_name)
+            result = await anyio.to_thread.run_sync(_load_and_commit_sync)
         except ValueError as ve:
             result = f"Error: {ve}"
-        else:
-            try:
-                with Device(**connect_params) as junos_device:
-                    # Initialize configuration utility
-                    config_util = Config(junos_device)
-
-                    # Lock the configuration
-                    try:
-                        config_util.lock()
-                    except Exception as e:
-                        result = f"Failed to lock configuration: {e}"
-                    else:
-                        try:
-                            # Load the configuration based on format
-                            if config_format.lower() == "set":
-                                config_util.load(config_text, format="set")
-                            elif config_format.lower() == "text":
-                                config_util.load(config_text, format="text")
-                            elif config_format.lower() == "xml":
-                                config_util.load(config_text, format="xml")
-                            else:
-                                config_util.unlock()
-                                result = (
-                                    f"Error: Unsupported config format "
-                                    f"'{config_format}'. Use 'set', 'text', or 'xml'"
-                                )
-
-                            if "result" not in locals():
-                                # Check for differences
-                                diff = config_util.diff()
-                                if not diff:
-                                    config_util.unlock()
-                                    result = "No configuration changes detected"
-                                else:
-                                    # Commit the configuration
-                                    config_util.commit(
-                                        comment=commit_comment, timeout=timeout
-                                    )
-                                    config_util.unlock()
-                                    result = (
-                                        "Configuration successfully loaded and "
-                                        f"committed on {router_name}. Changes:\n{diff}"
-                                    )
-
-                        except Exception as e:
-                            # If anything fails, rollback and unlock
-                            try:
-                                config_util.rollback()
-                                config_util.unlock()
-                            except (
-                                ConfigLoadError,
-                                CommitError,
-                                LockError,
-                                RuntimeError,
-                                OSError,
-                                AttributeError,
-                            ):
-                                pass
-                            result = f"Failed to load/commit configuration: {e}"
-
-            except ConnectError as ce:
-                result = f"Connection error to {router_name}: {ce}"
-            except Exception as e:
-                result = f"An error occurred: {e}"
+        except ConnectError as ce:
+            result = f"Connection error to {router_name}: {ce}"
+        except Exception as e:
+            result = f"An error occurred: {e}"
 
     content_block = types.TextContent(
         type="text",
@@ -2495,6 +2721,7 @@ def main():
     # Set up signal handler for clean shutdown
     def signal_handler(sig, frame):
         print("\nShutting down MCP server...")
+        connection_pool.close_all()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
